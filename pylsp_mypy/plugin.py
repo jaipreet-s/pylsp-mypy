@@ -19,6 +19,7 @@ import tempfile
 from configparser import ConfigParser
 from pathlib import Path
 from typing import IO, Any, Dict, List, Optional
+import pathlib
 
 try:
     import tomllib
@@ -45,6 +46,13 @@ whole_line_pattern = re.compile(  # certain mypy warnings do not report start-en
 )
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+file_handler = logging.FileHandler('/tmp/mypy_plugin.log')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+log.addHandler(file_handler)
+
+log.debug(f"Configured logger for mypy plugin {__name__}" )
 
 # A mapping from workspace path to config file path
 mypyConfigFileMap: Dict[str, Optional[str]] = {}
@@ -89,9 +97,14 @@ def parse_line(line: str, document: Optional[Document] = None) -> Optional[Dict[
         The dict with the lint data.
 
     """
-    result = line_pattern.match(line) or whole_line_pattern.match(line)
+    def remove_ascii_colors(s):
+        return re.sub(r'\x1b\[[0-9;]*m', '', s)
+
+    line_cleaned = remove_ascii_colors(line)
+    result = line_pattern.match(line_cleaned) or whole_line_pattern.match(line_cleaned)
 
     if not result:
+        log.warning(f"invalid line: {line}")
         return None
 
     file_path = result["file"]
@@ -254,8 +267,14 @@ def get_diagnostics(
         is_saved,
     )
 
+    if document.path.endswith("unsanitized"):
+        log.info(f'Skipping checks for the /unsanitize file {document.path}')
+        return []
+
     live_mode = settings.get("live_mode", True)
     dmypy = settings.get("dmypy", False)
+
+    log.info("live_mode = %s dmypy = %s", live_mode, dmypy)
 
     if dmypy and live_mode:
         # dmypy can only be efficiently run on files that have been saved, see:
@@ -268,16 +287,39 @@ def get_diagnostics(
 
     args = ["--show-error-end", "--no-error-summary", "--no-pretty"]
 
+    try:
+        log.debug(f'Starting  file to {document.path}')
+
+        # FORK - mypy doesn't do well with in memory contents so we write to a temp file instead
+        document_path = pathlib.Path(document.path)
+
+        log.debug(f'document_path: {document_path}')
+
+        if not document_path.name.endswith("unsanitized"):
+            document_path.parent.mkdir(parents=True, exist_ok=True)
+            log.debug(f'mkdir_done: {document_path}')
+        else:
+            log.debug(f'Skipping mkdir for path {document_path}')
+
+        log.debug(f'Starting writing')
+        with open(document_path, "w", encoding="utf-8") as file:
+            file.write(document.source)
+        log.debug(f'Writing done')
+    except Exception as e:
+        log.error(f'Error writing file to {document.path}: {e}')
+
+    log.info(f'Written file to {document.path}')
     global tmpFile
     if live_mode and not is_saved:
-        if tmpFile:
-            tmpFile = open(tmpFile.name, "w", encoding="utf-8")
-        else:
-            tmpFile = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
-        log.info("live_mode tmpFile = %s", tmpFile.name)
-        tmpFile.write(document.source)
-        tmpFile.close()
-        args.extend(["--shadow-file", document.path, tmpFile.name])
+        pass
+        # if tmpFile:
+        #     tmpFile = open(tmpFile.name, "w", encoding="utf-8")
+        # else:
+        #     tmpFile = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        # log.info("live_mode tmpFile = %s", tmpFile.name)
+        # tmpFile.write(document.source)
+        # tmpFile.close()
+        # args.extend(["--shadow-file", document.path, tmpFile.name])
     elif not is_saved and document.path in last_diagnostics:
         # On-launch the document isn't marked as saved, so fall through and run
         # the diagnostics anyway even if the file contents may be out of date.
@@ -301,7 +343,9 @@ def get_diagnostics(
     exit_status = 0
 
     if not dmypy:
-        args.extend(["--incremental", "--follow-imports", settings.get("follow-imports", "silent")])
+        # TODO: Should we remove --follow-imports?
+        args.extend(["--incremental"])
+        # args.extend(["--incremental", "--follow-imports", "silent"])
         args = apply_overrides(args, overrides)
 
         if shutil.which("mypy"):
@@ -309,7 +353,7 @@ def get_diagnostics(
             # -> use mypy on path
             log.info("executing mypy args = %s on path", args)
             completed_process = subprocess.run(
-                ["mypy", *args], capture_output=True, **windows_flag, encoding="utf-8"
+                ["dmypy", "run",  "--", *args], capture_output=True, **windows_flag, encoding="utf-8"
             )
             report = completed_process.stdout
             errors = completed_process.stderr
